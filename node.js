@@ -1,7 +1,10 @@
+import { EventSource } from "eventsource";
+
 const API = "https://en.wikipedia.org/w/api.php";
 const USER_AGENT = "LuniBot@Archiver/1 (https://en.wikipedia.org/wiki/User:LuniBot)";
 
 const cookies = new Map();
+const tokens = { age: Date.now(), lookup: { }, promise: Promise.resolve(null) };
 
 const mw = (async function(params) {
     const headers = { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT };
@@ -32,15 +35,21 @@ const parse_section = (function(codepoints) {
         const monthNumber = String(months.indexOf(month) + 1).padStart(2, "0");
         return new Date(`${year}-${monthNumber}-${day.padStart(2, "0")}T${hour}:${minute}:00Z`);
     }).sort((a, b) => a - b);
-    return { text, date: { oldest: timestamps[0], newest: timestamps.at(-1) } };
+    return { text, date: { oldest: timestamps[0], newest: timestamps.at(-1) }, mw_message_delivery: this.mw_message_delivery.test(text) };
 }).bind({
-    regex: /(?<=\s)(\d{2}):(\d{2}), (\d{1,2}) (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4}) \(UTC\)/g
+    regex: /(?<=\s)(\d{2}):(\d{2}), (\d{1,2}) (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4}) \(UTC\)/g,
+    mw_message_delivery: /<small>\[\[User:MediaWiki message delivery\|MediaWiki message delivery\]\] \(\[\[User talk:MediaWiki message delivery\|talk\]\]\) (?<=\s)(\d{2}):(\d{2}), (\d{1,2}) (January|February|March|April|May|June|July|August|September|October|November|December) (\d{4}) \(UTC\)<\/small>/g
 });
 
 const run = (async function(user) {
     const archiveDate = new Date();
 
-    const tokens = (await mw({ action: "query", meta: "tokens" })).query.tokens;
+    if (tokens.promise) await tokens.promise;
+    if (Date.now() < tokens.age + 900_000) {
+        tokens.promise = mw({ action: "query", meta: "tokens" });
+        tokens.lookup = (await tokens.promise).query.tokens;
+        tokens.age = Date.now();
+    }
 
     const pages = (await mw({
         "action": "query",
@@ -138,7 +147,7 @@ const run = (async function(user) {
             "title": `User talk:${user}`,
             "summary": `Archiving ${amount} discussion${amount > 1 ? "s" : ""} to ${pagesText}) (bot`,
             "text": filtered.reduce((acc, section) => `${acc}${section.text}`, start.join("")),
-            "token": tokens.csrftoken,
+            "token": tokens.lookup.csrftoken,
         });
     }
 
@@ -188,22 +197,15 @@ const run = (async function(user) {
             "title": page,
             "summary": `Archiving ${sections.length} discussion${sections.length > 1 ? "s" : ""} from [[User talk:${user}]]) (bot`,
             "text": archiveSections.reduce((acc, archiveSection) => `${acc}\n${archiveSection.text.trim()}\n`, `{{User:LuniZunie/ArchiveHeader|page={{#titleparts:{{PAGENAME}}|-3}}}}`).trim(),
-            "token": tokens.csrftoken,
+            "token": tokens.lookup.csrftoken,
         });
     }
 });
 
 const execute = (async function() {
-    await mw({
-        action: "login",
-        lgname: process.env.USERNAME,
-        lgpassword: process.env.PASSWORD,
-        lgtoken: (await mw({ action: "query", meta: "tokens", type: "login" })).query.tokens.logintoken
-    });
-
     await run("LuniZunie");
-    await run("LuniZunie/Subscriptions");
     await run("LuniZunie-Mentor");
+    await run("LuniZunie/Subscriptions");
 });
 
 const schedule = (function(first) {
@@ -217,4 +219,128 @@ const schedule = (function(first) {
         }
     }, first ? 0 : 3_600_000 - (Date.now() % 3_600_000));
 });
-schedule(true);
+
+const init = (async function() {
+    await mw({
+        action: "login",
+        lgname: process.env.BOT_USERNAME,
+        lgpassword: process.env.BOT_PASSWORD,
+        lgtoken: (await mw({ action: "query", meta: "tokens", type: "login" })).query.tokens.logintoken
+    });
+
+    schedule(true);
+
+    const stream = new EventSource("https://stream.wikimedia.org/v2/stream/recentchange");
+    stream.addEventListener("message", (function(event) {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type !== "edit") return;
+            if (data.wiki !== "enwiki") return;
+            if (data.user !== "MediaWiki message delivery") return;
+            if (!this.pages.has(data.title)) return;
+
+            (async function(page) {
+                if (tokens.promise) await tokens.promise;
+                if (Date.now() < tokens.age + 900_000) {
+                    tokens.promise = mw({ action: "query", meta: "tokens" });
+                    tokens.lookup = (await tokens.promise).query.tokens;
+                    tokens.age = Date.now();
+                }
+
+                const talk = Array.from((await mw({
+                    "action": "query",
+                    "prop": "revisions",
+                    "titles": page,
+                    "rvprop": "content",
+                    "rvslots": "*"
+                })).query.pages[0].revisions[0].slots.main.content);
+
+                const parsed = (await mw({
+                    "action": "parse",
+                    "page": page,
+                    "disablelimitreport": 1,
+                    "disableeditsection": 1,
+                    "disablestylededuplication": 1,
+                    "disabletoc": 1,
+                })).parse;
+
+                let start = "", offset;
+                const sections = [ ];
+                for (const section of parsed.tocdata.sections)
+                    if (section.hLevel === 2) {
+                        const temp = section.codepointOffset;
+                        if (offset !== undefined) sections.push(parse_section(talk.slice(offset, temp)));
+                        else start = talk.slice(0, temp);
+                        offset = temp;
+                    }
+                if (offset !== undefined) sections.push(parse_section(talk.slice(offset)));
+                else start = talk;
+
+                const sectionsToMove = [ ];
+                const filtered = sections.filter(section => {
+                    if (section.mw_message_delivery)
+                        return void(sectionsToMove.push(section));
+                    return true;
+                });
+
+                const amount = sections.length - filtered.length;
+                if (amount > 0) {
+                    mw({
+                        "action": "edit",
+                        "title": page,
+                        "summary": `Moving ${amount} discussion${amount > 1 ? "s" : ""} to [[User talk:LuniZunie/Subscriptions]]) (bot`,
+                        "text": filtered.reduce((acc, section) => `${acc}${section.text}`, start.join("")),
+                        "token": tokens.lookup.csrftoken,
+                    });
+
+                    const wt = Array.from((await mw({
+                        "action": "query",
+                        "prop": "revisions",
+                        "titles": "User talk:LuniZunie/Subscriptions",
+                        "rvprop": "content",
+                        "rvslots": "*"
+                    })).query.pages?.[0]?.revisions?.[0]?.slots?.main?.content ?? "");
+                    const parsed = (await mw({
+                        "action": "parse",
+                        "page": "User talk:LuniZunie/Subscriptions",
+                        "disablelimitreport": 1,
+                        "disableeditsection": 1,
+                        "disablestylededuplication": 1,
+                        "disabletoc": 1,
+                    })).parse ?? { tocdata: { sections: [ ] } };
+
+                    let offset;
+                    const subscriptionSections = [ ];
+                    for (const section of parsed.tocdata.sections)
+                        if (section.hLevel === 2) {
+                            const temp = section.codepointOffset;
+                            if (offset !== undefined) subscriptionSections.push(parse_section(wt.slice(offset, temp)));
+                            offset = temp;
+                        }
+                    if (offset !== undefined) subscriptionSections.push(parse_section(wt.slice(offset)));
+                    subscriptionSections.sort((a, b) => a.date.oldest - b.date.oldest);
+
+                    const sections = sectionsToMove;
+                    for (const section of sections) {
+                        const oldest = section.date.oldest;
+                        const length = subscriptionSections.length;
+                        for (let i = 0; i <= length; i++)
+                            if (oldest < (subscriptionSections[i]?.date?.oldest ?? Infinity)) {
+                                subscriptionSections.splice(i, 0, section);
+                                break;
+                            }
+                    }
+
+                    mw({
+                        "action": "edit",
+                        "title": "User talk:LuniZunie/Subscriptions",
+                        "summary": `Moving ${sections.length} discussion${sections.length > 1 ? "s" : ""} from [[${page}]]) (bot`,
+                        "text": subscriptionSections.reduce((acc, subscriptionSection) => `${acc}\n${subscriptionSection.text.trim()}\n`, `{{divbox|1=fawn|2=Attention fellow humans|3={{center|Please don't message me here!! This is a subpage for automated newsletters. Please use [[User talk:LuniZunie|my talk page]] instead. Thanks {{=}}D}}}}\n{{User:LuniZunie/ArchiveHeader}}`).trim(),
+                        "token": tokens.lookup.csrftoken,
+                    });
+                }
+            })(data.title);
+        } catch { }
+    }).bind({ pages: new Set([ "User talk:LuniZunie", "User talk:LuniZunie-Mentor", "User talk:LuniZunie/Sandbox" ]) }));
+});
+init();
